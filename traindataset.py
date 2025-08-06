@@ -1,20 +1,26 @@
 import os
 import json
 import gc
+import psutil
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
-from transformers import DonutProcessor, VisionEncoderDecoderModel, Seq2SeqTrainer, Seq2SeqTrainingArguments
-from tqdm import tqdm
+from transformers import (
+    DonutProcessor,
+    VisionEncoderDecoderModel,
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    TrainerCallback
+)
 
 # Usa apenas CPU
 device = torch.device("cpu")
 
-# Carrega o modelo e processador
+# Carrega modelo e processador
 processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
 model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
 
-# Ativa gradient checkpointing para economizar memória
+# Gradient checkpointing para economizar RAM
 model.gradient_checkpointing_enable()
 
 # Garante que o modelo esteja na CPU
@@ -27,7 +33,7 @@ model.config.pad_token_id = processor.tokenizer.pad_token_id
 if model.config.decoder_start_token_id is None:
     model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<s>")
 
-# Função para converter JSON em string formatada
+# Função que transforma JSON em string
 def json_para_string(dados):
     out = "<s_receita>"
     out += f"<s_medico>{dados['medico']}</s_medico>"
@@ -44,7 +50,7 @@ def json_para_string(dados):
     out += "</s_receita>"
     return out
 
-# Dataset customizado
+# Dataset personalizado
 class ReceitaDataset(Dataset):
     def __init__(self, img_dir, json_dir, processor, max_length=512):
         self.img_dir = img_dir
@@ -54,7 +60,8 @@ class ReceitaDataset(Dataset):
 
         self.examples = [
             (os.path.join(img_dir, f), os.path.join(json_dir, f.replace(".jpg", ".json")))
-            for f in os.listdir(img_dir) if f.endswith(".jpg") and os.path.exists(os.path.join(json_dir, f.replace(".jpg", ".json")))
+            for f in os.listdir(img_dir)
+            if f.endswith(".jpg") and os.path.exists(os.path.join(json_dir, f.replace(".jpg", ".json")))
         ]
 
     def __len__(self):
@@ -91,26 +98,38 @@ class ReceitaDataset(Dataset):
             "labels": input_ids
         }
 
+# Monitor de memória via callback
+class MemoryMonitorCallback(TrainerCallback):
+    def __init__(self, every_n_steps=10):
+        self.every_n_steps = every_n_steps
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.every_n_steps == 0:
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            mem_mb = mem_info.rss / (1024 ** 2)  # Em MB
+            print(f"🧠 [Passo {state.global_step}] Memória RAM usada: {mem_mb:.2f} MB")
+
 # Caminhos
 image_dir = "dataset_receitas/images"
 json_dir = "dataset_receitas/annotations"
 
-# Hiperparâmetros
+# Parâmetros
 batch_size = 1
 num_epochs = 10
 
-# Cria dataset
+# Dataset
 dataset = ReceitaDataset(image_dir, json_dir, processor)
 num_examples = len(dataset)
 max_steps = (num_examples * num_epochs) // batch_size
 print(f"📦 Dataset carregado com {num_examples} exemplos. Max steps: {max_steps}")
 
-# Dividir em treino/validação
+# Divisão treino/validação
 train_size = int(0.9 * len(dataset))
 val_size = len(dataset) - train_size
 train_dataset, eval_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-# Argumentos de treinamento para CPU
+# Argumentos do treinamento
 args = Seq2SeqTrainingArguments(
     output_dir="./donut-receitas",
     per_device_train_batch_size=batch_size,
@@ -120,26 +139,27 @@ args = Seq2SeqTrainingArguments(
     logging_steps=10,
     save_steps=500,
     save_total_limit=2,
-    fp16=False,  # DESATIVADO porque não há GPU
+    fp16=False,  # CPU não suporta float16
     eval_strategy="no",
     max_steps=max_steps
 )
 
-# Trainer
+# Cria trainer com o monitor de RAM
 trainer = Seq2SeqTrainer(
     model=model,
     args=args,
     train_dataset=train_dataset,
-    eval_dataset=eval_dataset
+    eval_dataset=eval_dataset,
+    callbacks=[MemoryMonitorCallback(every_n_steps=5)]
 )
 
-# Iniciar o treinamento
+# Inicia o treinamento
 trainer.train()
 
-# Libera memória após o treinamento
+# Libera memória depois
 gc.collect()
 
-# Salvar modelo e tokenizer
+# Salva modelo e tokenizer
 model.save_pretrained("./donut-receitas")
 processor.tokenizer.save_pretrained("./donut-receitas")
 
