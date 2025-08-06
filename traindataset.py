@@ -1,28 +1,33 @@
-from transformers import DonutProcessor, VisionEncoderDecoderModel, Seq2SeqTrainer, Seq2SeqTrainingArguments
-from datasets import Dataset
+import os
+import json
+import gc
 from PIL import Image
 import torch
-import json
-import os
-import gc
+from torch.utils.data import Dataset
+from transformers import DonutProcessor, VisionEncoderDecoderModel, Seq2SeqTrainer, Seq2SeqTrainingArguments
 from tqdm import tqdm
 
-# 1. Carrega o modelo e processador
+# Usa apenas CPU
+device = torch.device("cpu")
+
+# Carrega o modelo e processador
 processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
 model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
 
-# Se o tokenizer não tiver pad_token, defina-o manualmente
+# Ativa gradient checkpointing para economizar memória
+model.gradient_checkpointing_enable()
+
+# Garante que o modelo esteja na CPU
+model.to(device)
+
+# Configuração de tokens especiais
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = "<pad>"
-
-# Agora, defina o pad_token_id no modelo
 model.config.pad_token_id = processor.tokenizer.pad_token_id
-
-# Definir o decoder_start_token_id
 if model.config.decoder_start_token_id is None:
     model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<s>")
 
-# 2. Conversão do JSON para string formatada
+# Função para converter JSON em string formatada
 def json_para_string(dados):
     out = "<s_receita>"
     out += f"<s_medico>{dados['medico']}</s_medico>"
@@ -39,122 +44,103 @@ def json_para_string(dados):
     out += "</s_receita>"
     return out
 
-# 3. Carrega dados do diretório
-def carregar_dados(img_dir, json_dir):
-    dados = []
-    for nome_img in os.listdir(img_dir):
-        if not nome_img.endswith(".jpg"):
-            continue
+# Dataset customizado
+class ReceitaDataset(Dataset):
+    def __init__(self, img_dir, json_dir, processor, max_length=512):
+        self.img_dir = img_dir
+        self.json_dir = json_dir
+        self.processor = processor
+        self.max_length = max_length
 
-        caminho_img = os.path.join(img_dir, nome_img)
-        caminho_json = os.path.join(json_dir, nome_img.replace(".jpg", ".json"))
+        self.examples = [
+            (os.path.join(img_dir, f), os.path.join(json_dir, f.replace(".jpg", ".json")))
+            for f in os.listdir(img_dir) if f.endswith(".jpg") and os.path.exists(os.path.join(json_dir, f.replace(".jpg", ".json")))
+        ]
 
-        if not os.path.exists(caminho_img) or not os.path.exists(caminho_json):
-            print(f"❌ Arquivo ausente: {nome_img}")
-            continue
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        img_path, json_path = self.examples[idx]
 
         try:
-            with open(caminho_json, "r") as f:
-                info = json.load(f)
-            prompt = json_para_string(info)
+            image = Image.open(img_path).convert("RGB").resize((640, 480))
+            pixel_values = self.processor(image, return_tensors="pt").pixel_values[0]
         except Exception as e:
-            print(f"❌ Erro ao ler JSON: {caminho_json} | Erro: {e}")
-            continue
+            print(f"Erro ao processar imagem: {img_path} | {e}")
+            pixel_values = torch.zeros((3, 480, 640))
 
-        dados.append({
-            "image_path": caminho_img,
-            "target_text": prompt
-        })
-
-    print(f"✅ Total de exemplos carregados: {len(dados)}")
-    return Dataset.from_list(dados)
-
-# 4. Transformação para ser aplicada via map()
-def transform(batch):
-    pixel_values_list = []
-    labels_list = []
-
-    for image_path, target_text in zip(batch["image_path"], batch["target_text"]):
         try:
-            # Carregar e processar imagem
-            image = Image.open(image_path).convert("RGB")
-            image = image.resize((640, 480))  # Resolução ajustada
-            pixel_values = processor(image, return_tensors="pt").pixel_values[0]
-
-            # Tokenização do texto
-            input_ids = processor.tokenizer(
-                target_text,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=512
-            ).input_ids[0]
-
-            # Acumular resultados para a lista
-            pixel_values_list.append(pixel_values.numpy())
-            labels_list.append(input_ids.numpy())
-
-            # Limpeza de recursos de memória
-            del image
-            gc.collect()
-            torch.cuda.empty_cache()
-
+            with open(json_path, "r", encoding="latin1") as f:
+                json_data = json.load(f)
+            target_text = json_para_string(json_data)
         except Exception as e:
-            print(f"❌ Erro ao processar imagem: {image_path}")
-            print(f"🧾 Detalhes: {e}")
-            pixel_values_list.append(torch.zeros((3, 768, 1024)).numpy())  # Usando zeros
-            labels_list.append(torch.full((512,), -100).numpy())  # Preenchendo com -100 (token de pad)
+            print(f"Erro ao ler {json_path}: {e}")
+            target_text = ""
 
-    return {
-        "pixel_values": pixel_values_list,
-        "labels": labels_list
-    }
+        input_ids = self.processor.tokenizer(
+            target_text,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length
+        ).input_ids[0]
 
-# 5. Carregar o dataset
-dataset = carregar_dados("dataset_receitas/images", "dataset_receitas/annotations")
+        return {
+            "pixel_values": pixel_values,
+            "labels": input_ids
+        }
 
-# 6. Aplica transformação com map (batched=True, tamanho do lote ajustado)
-dataset = dataset.map(transform, batched=True, batch_size=1)  # Ajuste no batch_size
+# Caminhos
+image_dir = "dataset_receitas/images"
+json_dir = "dataset_receitas/annotations"
 
-# 7. Ajusta o formato para PyTorch com as colunas necessárias (antes de dividir)
-dataset.set_format(type="torch", columns=["pixel_values", "labels"])
+# Hiperparâmetros
+batch_size = 1
+num_epochs = 10
 
-# 8. Dividir o dataset em treino e validação
-train_size = int(0.9 * len(dataset))  # 90% para treino
-val_size = len(dataset) - train_size  # 10% para validação
+# Cria dataset
+dataset = ReceitaDataset(image_dir, json_dir, processor)
+num_examples = len(dataset)
+max_steps = (num_examples * num_epochs) // batch_size
+print(f"📦 Dataset carregado com {num_examples} exemplos. Max steps: {max_steps}")
+
+# Dividir em treino/validação
+train_size = int(0.9 * len(dataset))
+val_size = len(dataset) - train_size
 train_dataset, eval_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-# 9. Argumentos do treinamento
+# Argumentos de treinamento para CPU
 args = Seq2SeqTrainingArguments(
     output_dir="./donut-receitas",
-    per_device_train_batch_size=1,
-    num_train_epochs=10,
+    per_device_train_batch_size=batch_size,
+    per_device_eval_batch_size=batch_size,
+    dataloader_num_workers=0,
     logging_dir="./logs",
     logging_steps=10,
     save_steps=500,
     save_total_limit=2,
-    fp16=torch.cuda.is_available(),
-    evaluation_strategy="epoch",  # Avalia ao final de cada época
-    dataloader_num_workers=0  # Evitar múltiplos workers para o dataloader
+    fp16=False,  # DESATIVADO porque não há GPU
+    eval_strategy="no",
+    max_steps=max_steps
 )
 
-# 10. Configura o trainer
+# Trainer
 trainer = Seq2SeqTrainer(
     model=model,
     args=args,
     train_dataset=train_dataset,
-    eval_dataset=eval_dataset,  # Passando o eval_dataset para a avaliação
+    eval_dataset=eval_dataset
 )
 
-# 11. Inicia o treino
+# Iniciar o treinamento
 trainer.train()
 
-print("\n🔒 Salvando o modelo treinado...")
+# Libera memória após o treinamento
+gc.collect()
 
-# Salva o modelo treinado
+# Salvar modelo e tokenizer
 model.save_pretrained("./donut-receitas")
-
-# Salva o tokenizador
 processor.tokenizer.save_pretrained("./donut-receitas")
 
-print("✅ Modelo e tokenizador salvos com sucesso!")
+print("✅ Treinamento concluído e modelo salvo com sucesso!")
