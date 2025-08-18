@@ -4,7 +4,7 @@ import gc
 import psutil
 from PIL import Image
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, random_split
 from transformers import (
     DonutProcessor,
     VisionEncoderDecoderModel,
@@ -12,28 +12,28 @@ from transformers import (
     Seq2SeqTrainingArguments,
     TrainerCallback
 )
+from difflib import SequenceMatcher
 
-# Usa apenas CPU
+# Dispositivo: apenas CPU
 device = torch.device("cpu")
 
-# Carrega modelo e processador
+# Carrega modelo e processor
 processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
 model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
 
-# Gradient checkpointing para economizar RAM
+# Configurações básicas
+model.to(device)
 model.gradient_checkpointing_enable()
 
-# Garante que o modelo esteja na CPU
-model.to(device)
-
-# Configuração de tokens especiais
+# Tokens especiais
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = "<pad>"
-model.config.pad_token_id = processor.tokenizer.pad_token_id
-if model.config.decoder_start_token_id is None:
-    model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<s>")
 
-# Função que transforma JSON em string
+model.config.pad_token_id = processor.tokenizer.pad_token_id
+model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<s>")
+model.config.eos_token_id = processor.tokenizer.eos_token_id
+
+# Função para transformar JSON em string estruturada
 def json_para_string(dados):
     out = "<s_receita>"
     out += f"<s_medico>{dados['medico']}</s_medico>"
@@ -74,7 +74,7 @@ class ReceitaDataset(Dataset):
             image = Image.open(img_path).convert("RGB").resize((640, 480))
             pixel_values = self.processor(image, return_tensors="pt").pixel_values[0]
         except Exception as e:
-            print(f"Erro ao processar imagem: {img_path} | {e}")
+            print(f"Erro na imagem: {img_path} | {e}")
             pixel_values = torch.zeros((3, 480, 640))
 
         try:
@@ -82,7 +82,7 @@ class ReceitaDataset(Dataset):
                 json_data = json.load(f)
             target_text = json_para_string(json_data)
         except Exception as e:
-            print(f"Erro ao ler {json_path}: {e}")
+            print(f"Erro no JSON: {json_path} | {e}")
             target_text = ""
 
         input_ids = self.processor.tokenizer(
@@ -93,41 +93,65 @@ class ReceitaDataset(Dataset):
             max_length=self.max_length
         ).input_ids[0]
 
-        return {
-            "pixel_values": pixel_values,
-            "labels": input_ids
-        }
+        return {"pixel_values": pixel_values, "labels": input_ids}
 
-# Monitor de memória via callback
-class MemoryMonitorCallback(TrainerCallback):
-    def __init__(self, every_n_steps=10):
-        self.every_n_steps = every_n_steps
+# Collator para o Trainer — junta pixel_values e labels em batches
+def data_collator(features):
+    pixel_values = torch.stack([f["pixel_values"] for f in features])
+    labels = torch.stack([f["labels"] for f in features])
+    return {"pixel_values": pixel_values, "labels": labels}
 
+# Callback para monitorar uso de memória e limpar a cada época
+class MemoriaCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.every_n_steps == 0:
-            process = psutil.Process(os.getpid())
-            mem_info = process.memory_info()
-            mem_mb = mem_info.rss / (1024 ** 2)  # Em MB
-            print(f"🧠 [Passo {state.global_step}] Memória RAM usada: {mem_mb:.2f} MB")
+        if state.global_step % 5 == 0:
+            processo = psutil.Process(os.getpid())
+            mem = processo.memory_info().rss / (1024 ** 2)
+            print(f"🧠 Passo {state.global_step}: RAM usada {mem:.2f} MB")
 
-# Caminhos
+    def on_epoch_end(self, args, state, control, **kwargs):
+        gc.collect()
+        print("🧹 Memória liberada no fim da época")
+
+# Função de similaridade (Levenshtein simplificado)
+def calcular_similaridade(pred, label):
+    return SequenceMatcher(None, pred, label).ratio()
+
+# Pós-treinamento: avaliar algumas previsões
+def avaliar_amostras(model, dataset, processor, n=3):
+    model.eval()
+    for i in range(min(n, len(dataset))):
+        entrada = dataset[i]
+        with torch.no_grad():
+            pixel_values = entrada["pixel_values"].unsqueeze(0).to(device)
+            rotulo = processor.tokenizer.decode(
+                entrada["labels"], skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
+            saida_ids = model.generate(pixel_values, max_length=512)
+            predicao = processor.batch_decode(saida_ids, skip_special_tokens=True)[0]
+            sim = calcular_similaridade(predicao, rotulo)
+            print(f"\n🔍 Amostra {i+1}:")
+            print(f"✔️ Esperado: {rotulo}")
+            print(f"🤖 Predito : {predicao}")
+            print(f"📏 Similaridade: {sim:.2f}")
+    model.train()
+
+# Diretórios
 image_dir = "dataset_receitas/images"
 json_dir = "dataset_receitas/annotations"
 
-# Parâmetros
+# Hiperparâmetros
 batch_size = 1
 num_epochs = 10
 
-# Dataset
+# Carregamento de dataset
 dataset = ReceitaDataset(image_dir, json_dir, processor)
-num_examples = len(dataset)
-max_steps = (num_examples * num_epochs) // batch_size
-print(f"📦 Dataset carregado com {num_examples} exemplos. Max steps: {max_steps}")
-
-# Divisão treino/validação
 train_size = int(0.9 * len(dataset))
 val_size = len(dataset) - train_size
-train_dataset, eval_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+train_dataset, eval_dataset = random_split(dataset, [train_size, val_size])
+
+max_steps = (len(train_dataset) * num_epochs) // batch_size
+print(f"📦 Dados carregados: {len(dataset)} exemplos | Max steps: {max_steps}")
 
 # Argumentos do treinamento
 args = Seq2SeqTrainingArguments(
@@ -139,28 +163,36 @@ args = Seq2SeqTrainingArguments(
     logging_steps=10,
     save_steps=500,
     save_total_limit=2,
-    fp16=False,  # CPU não suporta float16
-    eval_strategy="no",
-    max_steps=max_steps
+    fp16=False,
+    evaluation_strategy="epoch",  # Avaliação ao fim de cada época
+    num_train_epochs=num_epochs,
+    predict_with_generate=True
 )
 
-# Cria trainer com o monitor de RAM
+# Trainer
 trainer = Seq2SeqTrainer(
     model=model,
     args=args,
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
-    callbacks=[MemoryMonitorCallback(every_n_steps=5)]
+    tokenizer=processor.tokenizer,
+    data_collator=data_collator,
+    callbacks=[MemoriaCallback()]
 )
 
-# Inicia o treinamento
+# Início do treinamento
 trainer.train()
+# Vou reiniciar do checkpoint para não precisar treinar o resto!
+#trainer.train(resume_from_checkpoint="./donut-receitas/checkpoint-500")
 
-# Libera memória depois
+# Pós-treinamento: amostras avaliadas
+avaliar_amostras(model, eval_dataset, processor, n=3)
+
+# Limpeza final
 gc.collect()
 
-# Salva modelo e tokenizer
+# Salvamento do modelo e processor
 model.save_pretrained("./donut-receitas")
-processor.tokenizer.save_pretrained("./donut-receitas")
+processor.save_pretrained("./donut-receitas")
 
 print("✅ Treinamento concluído e modelo salvo com sucesso!")

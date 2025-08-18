@@ -13,8 +13,8 @@ def predizer_prescricao(imagem_path):
     pixel_values = processor(images=image, return_tensors="pt").pixel_values
 
     # Gerar a predição (com decodificação)
-    output = model.generate(pixel_values)
-    
+    output = model.generate(pixel_values, max_new_tokens=500)
+
     # Converter a saída (IDs) para texto
     predicao = processor.decode(output[0], skip_special_tokens=True)
     
