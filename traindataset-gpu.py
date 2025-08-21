@@ -26,16 +26,39 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🖥️ Dispositivo em uso: {device}")
 
 # 🔽 Carrega modelo e processor
+# 🔽 Carrega modelo e processor
 processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
 model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
 
-# ⚙️ Configurações
+# ⚙️ Adiciona tokens especiais personalizados
+special_tokens = [
+    "<s_receita>", "</s_receita>",
+    "<s_medico>", "</s_medico>",
+    "<s_crm>", "</s_crm>",
+    "<s_paciente>", "</s_paciente>",
+    "<s_tipo>", "</s_tipo>",
+    "<s_posologia>", "</s_posologia>",
+    "<s_componentes>", "</s_componentes>",
+    "<s_componente>", "</s_componente>",
+    "<s_dosagem>", "</s_dosagem>",
+    "<s_unidade>", "</s_unidade>"
+]
+
+num_added_tokens = processor.tokenizer.add_tokens(special_tokens)
+print(f"✅ {num_added_tokens} tokens especiais adicionados ao tokenizer.")
+
+# Redimensiona embeddings do modelo para incluir os novos tokens
+model.resize_token_embeddings(len(processor.tokenizer))
+
+# ⚙️ Configurações corretas de tokens especiais
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = "<pad>"
+    processor.tokenizer.add_special_tokens({'pad_token': "<pad>"})
 
 model.config.pad_token_id = processor.tokenizer.pad_token_id
-model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<s>")
-model.config.eos_token_id = processor.tokenizer.eos_token_id
+model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids("<s_receita>")
+model.config.eos_token_id = processor.tokenizer.convert_tokens_to_ids("</s_receita>")
+
 
 model.to(device)
 model.gradient_checkpointing_enable()
